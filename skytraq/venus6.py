@@ -15,6 +15,9 @@ class Venus6:
 
   MSG_TYPE_CONF_SERIAL        = 0x05
 
+  MSG_TYPE_POS_UPDATE_RATE    = 0x0E
+  MSG_TYPE_POS_UPDATE_RATE_Q  = 0x10
+
   MSG_TYPE_LOG_STATUS_Q       = 0x17
   MSG_TYPE_LOG_CLEAR          = 0x19
   MSG_TYPE_LOG_READ_BATCH     = 0x1D
@@ -29,6 +32,8 @@ class Venus6:
 
   MSG_TYPE_ACK                = 0x83
   MSG_TYPE_NACK               = 0x84
+
+  MSG_TYPE_POS_UPDATE_RATE_R  = 0x86
 
   MSG_TYPE_LOG_STATUS_R       = 0x94
 
@@ -61,6 +66,13 @@ class Venus6:
     "return if line content is NMEA cf: http://en.wikipedia.org/wiki/NMEA_0183"
     return buf[0] == ord('$')
 
+  def binaryCmd(self, MsgId, payload=[], response=False):
+    success = self.sendCmd(MsgId, bytearray(payload))
+
+    if response:
+      return self.readResponse()
+
+
   def setSerialSpeed(self, speed):
     "Set the host serial port speed"
 
@@ -85,32 +97,29 @@ class Venus6:
       bytearray([
         0x00, # COM1
         speedIdx,
-        0x00 # only update sram
+        0x01 # update flash
       ]))
-
-    print("speed changed to", speed)
 
     self.serial.flush()
 
     # update baudrate
     self.serial.baudrate = speed
 
-    print(self.readline())
-
   def guessSerialSpeed(self):
     "Attempt to guess host serial port speed"
     for speed in [ 9600, 115200, 4800, 19200, 38400, 57600 ]:
       self.serial.baudrate = speed
       try:
-        rep = self.getSoftwareVersion(0)
+        rep = self.getSoftwareVersion()
         if self.debug:
           print("got software version", rep, "at speed", speed)
         return speed
       except Exception as e:
-        print("failed to get soft version at speed", speed, e)
+        # print("failed to get soft version at speed", speed, e)
+        continue
     raise Exception("failed to guess serial speed")
 
-  def readResponse(self, expectedRespId=None, expectedLen=0, maxAttempts=256):
+  def readResponse(self, expectedRespId=None, expectedLen=0, maxAttempts=2048):
     "read a response from gps, discarding NMEA output"
     attempt = 0
     prev = 0
@@ -121,29 +130,32 @@ class Venus6:
     while attempt < maxAttempts:
 
       c = self.serial.read()
-      if c[0] == 0xA1 and prev == 0xA0:
+      if c == '\xa1' and prev == '\xa0':
         break
       tmp += c
       prev = c[0]
       attempt += 1
 
     if attempt >= maxAttempts:
-      raise Exception("failed to get response after reading %d bytes" % attempt, tmp)
+      print("no response")
+      return 0, []
 
     # read length
     l = self.serial.read(2)
-    payloadLen = l[0] << 8 | l[1]
-    msgId = self.serial.read()[0]
-    payload = self.serial.read(payloadLen - 1)
+    payloadLen = struct.unpack(">H", l)[0]
+    msgId = struct.unpack(">B", self.serial.read()[0])[0]
+    char_payload = self.serial.read(payloadLen - 1)
+    payload = [struct.unpack(">B", byte)[0] for byte in char_payload]
 
     # read checksum
-    checksum = self.serial.read()[0]
+    checksum = struct.unpack(">B", self.serial.read()[0])[0]
     # compare checksum
     check = 0 ^ msgId
     for b in payload:
       check ^= b
     if check != checksum:
-      raise Exception("received msg with invalid checksum", check, checksum)
+      print("invalid checksum")
+      return 0, []
 
     # read end of sequence
     eos = self.serial.read(2)
@@ -162,6 +174,7 @@ class Venus6:
     return msgId, payload
 
   def sendCmd(self, msgId, payload, maxAttempts=5, expectAck=True):
+    self.serial.flushInput()
     "sends a binary message to venus gps"
     msg = bytearray([0xA0, 0xA1]) # start of sequence
     payloadLen = 1 + len(payload)
@@ -173,7 +186,8 @@ class Venus6:
     msg.append(msgId)
     checksum ^= msgId
     # payload
-    msg += payload
+    if payload:
+      msg += payload
     for b in payload:
       checksum ^= b
     # checksum
@@ -191,20 +205,19 @@ class Venus6:
         repId, repPayload = self.readResponse()
         if repId == self.MSG_TYPE_NACK:
           if repPayload[0] == msgId:
-            raise Exception("got NACK from gps")
+            return False
         elif repId == self.MSG_TYPE_ACK:
           if repPayload[0] == msgId:
-            # ok got ack
-            break
-        elif self.debug:
-          print("received unexpected", repId, repPayload)
+            return True
 
       if i >= maxAttempts:
-        raise Exception("failed to get ack for query")
+        return False
+    else:
+      return True
 
-  def getSoftwareVersion(self, versionType):
+  def getSoftwareVersion(self):
     "Get running software version on host"
-    self.sendCmd(self.MSG_TYPE_SOFT_VERSION_Q, bytearray([versionType]))
+    self.sendCmd(self.MSG_TYPE_SOFT_VERSION_Q, [])
 
     # read response
     msgId, payload = self.readResponse(self.MSG_TYPE_SOFT_VERSION_R, 13)
@@ -215,14 +228,15 @@ class Venus6:
                                   payload[7], payload[8])
     revision = "%d/%d/%d" % (payload[9] << 8 | payload[10],
                                   payload[11], payload[12])
-    return (versionType, kernelVersion, odmVersion, revision)
+    return (kernelVersion, odmVersion, revision)
 
   def getSoftwareCRC(self):
     "Get CRC of software running on host"
-    self.sendCmd(self.MSG_TYPE_SOFT_CRC_Q, bytearray([0x01]))
+    self.sendCmd(self.MSG_TYPE_SOFT_CRC_Q, [])
     # read response
     msgId, payload = self.readResponse(self.MSG_TYPE_SOFT_CRC_R, 3)
-    return (payload[1:3])
+    if msgId:
+      return (payload[1:3])
 
   def getLogStatus(self):
     "Get log buffer status / NOTE: number transmitted in little endian"
@@ -480,19 +494,29 @@ class Venus6:
     # drop received data
     self.serial.flushInput()
 
+  def getPositionUpdateRate(self):
+    self.sendCmd(self.MSG_TYPE_POS_UPDATE_RATE_Q, bytearray())
+    msgId, payload = self.readResponse(self.MSG_TYPE_POS_UPDATE_RATE_R, 1)
+    return payload[0]
+
+  def setPositionUpdateRate(self, rate):
+    if rate in [1, 2, 4, 5, 8, 10, 20]:
+      self.sendCmd(self.MSG_TYPE_POS_UPDATE_RATE, bytearray([rate]))
+      time.sleep(1)
+      self.serial.flushInput()
+    else:
+      print "invalid choice of update rate"
+
   def getNavigationMode(self):
     "get navigation from host"
     self.sendCmd(self.MSG_TYPE_NAV_MODE_GET, bytearray())
     # read response
     msgId, payload = self.readResponse(self.MSG_TYPE_NAV_MODE_GET_R, 1)
-    return "pedestrian" if payload[0] else "car"
+    return payload[0]
 
-  def setNavigationMode(self, pedestrian, persist=True):
+  def setNavigationMode(self, mode, persist=True):
     "set navigation mode"
-    self.sendCmd(self.MSG_TYPE_NAV_MODE_SET, bytearray([
-      1 if pedestrian else 0,
-      1 if persist else 0,
-    ]))
+    self.sendCmd(self.MSG_TYPE_NAV_MODE_SET, bytearray([mode]))
     # give time to reboot
     time.sleep(1)
     # drop received data
