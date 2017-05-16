@@ -31,12 +31,13 @@ This protocol is specified in two application notes:
 - configure serial port speed
 - probe serial port speed
 - write ephemeris data (agps) to device (UNTESTED)
+- read/write position output rate
+- configure navigation mode
 
 ## TODO
 - read/write data logging parameters
 - read/write nmea output configuration
 - read/write output format
-- read/write position output rate
 - restart system
 - reset to factory default
 
